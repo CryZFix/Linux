@@ -1,97 +1,106 @@
 #!/bin/bash
 
-# Убедитесь, что сценарий выполняется с root-правами
 if [[ $EUID -ne 0 ]]; then
-   echo "Этот скрипт должен выполняться от имени root"
+   echo "Запускайте скрипт от root."
    exit 1
 fi
 
-# Переменные
-MAKECONF="/etc/portage/make.conf"
-DISK=""
-KERNEL_TYPE="source"  # По умолчанию компилируемое ядро
+if [ ! -d "/sys/firmware/efi" ]; then
+    echo "Ошибка: Система не загружена в режиме UEFI."
+    exit 1
+fi
 
-# Парсинг аргументов командной строки
+# --- ПЕРЕМЕННЫЕ ---
+DISK=""
+KERNEL_TYPE="binary"
+
 while getopts "d:k:" opt; do
   case ${opt} in
     d ) DISK=$OPTARG ;;
     k ) KERNEL_TYPE=$OPTARG ;;
-    \? ) echo "Использование: $0 [-d диск] [-k ядро: binary или source]"
+    \? ) echo "Использование: $0 -d /dev/nvme0n1 [-k binary|source]"
          exit 1 ;;
   esac
 done
 
-# Проверка, что указан диск
 if [[ -z "$DISK" ]]; then
-  echo "Ошибка: необходимо указать диск с помощью опции -d"
+  echo "Ошибка: укажите диск (например: -d /dev/sda или -d /dev/nvme0n1)"
   exit 1
 fi
 
-# Подготовка разделов
-EFI_PART="${DISK}1"
-BOOT_PART="${DISK}2"
-SWAP_PART="${DISK}3"
-ROOT_PART="${DISK}4"
-HOME_PART="${DISK}5"
+# Определяем суффикс разделов (p1 для nvme, 1 для sda)
+if [[ "$DISK" == *"nvme"* ]]; then PART_PREFIX="p"; else PART_PREFIX=""; fi
 
-echo "Создание разделов на ${DISK}..."
+EFI_PART="${DISK}${PART_PREFIX}1"
+SWAP_PART="${DISK}${PART_PREFIX}2"
+ROOT_PART="${DISK}${PART_PREFIX}3"
+
+# --- 1. РАЗМЕТКА ДИСКА ---
+echo ">>> Разметка диска ${DISK}..."
+wipefs -a "$DISK"
 parted -s "$DISK" mklabel gpt
-parted -s "$DISK" mkpart primary fat32 1MiB 512MiB
-parted -s "$DISK" set 1 boot on
-parted -s "$DISK" mkpart primary ext2 512MiB 1024MiB
-parted -s "$DISK" mkpart primary linux-swap 1024MiB 5120MiB
-parted -s "$DISK" mkpart primary ext4 5120MiB 125120MiB
-parted -s "$DISK" mkpart primary ext4 125120MiB 100%
+# 1. EFI (1GB)
+parted -s "$DISK" mkpart "EFI" fat32 1MiB 1024MiB
+parted -s "$DISK" set 1 esp on
+# 2. SWAP (4GB)
+parted -s "$DISK" mkpart "SWAP" linux-swap 1024MiB 5120MiB
+# 3. ROOT (Остальное)
+parted -s "$DISK" mkpart "ROOT" ext4 5120MiB 100%
 
-# Форматирование разделов
-echo "Форматирование разделов..."
+echo ">>> Форматирование..."
 mkfs.vfat -F 32 "$EFI_PART"
-mkfs.ext2 "$BOOT_PART"
 mkswap "$SWAP_PART"
 mkfs.ext4 "$ROOT_PART"
-mkfs.ext4 "$HOME_PART"
 
-# Монтирование разделов
-echo "Монтирование разделов..."
+echo ">>> Монтирование..."
 mount "$ROOT_PART" /mnt/gentoo
-mkdir -p /mnt/gentoo/{boot,home}
-mount "$BOOT_PART" /mnt/gentoo/boot
-mkdir -p /mnt/gentoo/boot/efi
-mount "$EFI_PART" /mnt/gentoo/boot/efi
-mount "$HOME_PART" /mnt/gentoo/home
+mkdir -p /mnt/gentoo/efi
+mount "$EFI_PART" /mnt/gentoo/efi
 swapon "$SWAP_PART"
 
-# Загрузка и распаковка Stage3
-DISTMIRROR=http://distfiles.gentoo.org
-DISTBASE=${DISTMIRROR}/releases/amd64/autobuilds/current-stage3-amd64-openrc/
-FILE=$(wget -q ${DISTMIRROR}/releases/amd64/autobuilds/current-stage3-amd64-openrc/latest-stage3-amd64-openrc.txt -O - | grep -o -E 'stage3-amd64-openrc-20\w*\.tar\.(bz2|xz)')
-echo "Загрузка и распаковка Stage3..."
+# --- 2. ЗАГРУЗКА STAGE3 ---
+echo ">>> Получение Stage3..."
 cd /mnt/gentoo
-wget "$DISTBASE$FILE" -O stage3.tar.xz
-tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner
+DISTMIRROR="https://distfiles.gentoo.org/releases/amd64/autobuilds"
+LATEST_TXT="${DISTMIRROR}/current-stage3-amd64-openrc/latest-stage3-amd64-openrc.txt"
+STAGE3_PATH=$(curl -s "$LATEST_TXT" | grep -v "^#" | grep "stage3-amd64-openrc" | awk '{print $1}' | head -n 1)
+STAGE3_URL="${DISTMIRROR}/current-stage3-amd64-openrc/${STAGE3_PATH}"
+
+echo "Скачивание: $STAGE3_URL"
+wget -q --show-progress "$STAGE3_URL" -O stage3.tar.xz
+
+echo ">>> Распаковка..."
+tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner > /dev/null
 rm stage3.tar.xz
 
-# Подтягиваем fstab
-curl -OL https://raw.githubusercontent.com/CryZFix/Linux/main/gentoo/genfstab
-chmod +x genfstab
-mkdir -p /mnt/gentoo/etc
-./genfstab /mnt/gentoo > /mnt/gentoo/etc/fstab
-
-# Настройка make.conf
-echo "Настройка make.conf..."
-sed -i 's/COMMON_FLAGS="-O2 -pipe"/COMMON_FLAGS="-march=native -O2 -pipe"/' /mnt/gentoo/etc/portage/make.conf
+# --- 3. НАСТРОЙКА MAKE.CONF ---
+echo ">>> Настройка make.conf..."
 cat <<EOF > /mnt/gentoo/etc/portage/make.conf
-CFLAGS="-O2 -pipe"
-CXXFLAGS="\${CFLAGS}"
+COMMON_FLAGS="-march=native -O2 -pipe"
+CFLAGS="\${COMMON_FLAGS}"
+CXXFLAGS="\${COMMON_FLAGS}"
+FCFLAGS="\${COMMON_FLAGS}"
+FFLAGS="\${COMMON_FLAGS}"
+
 MAKEOPTS="-j$(nproc)"
-USE="wifi"
+LC_MESSAGES=C.utf8
+
+FEATURES="getbinpkg"
+ACCEPT_LICENSE="*"
+
+# Локализация и Видео
+L10N="en ru"
+VIDEO_CARDS="intel i965 iris nouveau"
+USE="-systemd -gnome -kde -aqua -wayland X"
 EOF
 
-mkdir /mnt/gentoo/etc/portage/repos.conf
+# Копируем настройки репозитория
+mkdir -p /mnt/gentoo/etc/portage/repos.conf
 cp /mnt/gentoo/usr/share/portage/config/repos.conf /mnt/gentoo/etc/portage/repos.conf/gentoo.conf
 
-# Монтирование системных файловых систем
-echo "Монтирование системных файловых систем..."
+# --- 4. ПОДГОТОВКА CHROOT ---
+echo ">>> Подготовка Chroot..."
+cp --dereference /etc/resolv.conf /mnt/gentoo/etc/
 mount --types proc /proc /mnt/gentoo/proc
 mount --rbind /sys /mnt/gentoo/sys
 mount --make-rslave /mnt/gentoo/sys
@@ -100,87 +109,84 @@ mount --make-rslave /mnt/gentoo/dev
 mount --bind /run /mnt/gentoo/run
 mount --make-slave /mnt/gentoo/run
 
-# Настройка сети для chroot
-cp /etc/resolv.conf /mnt/gentoo/etc/resolv.conf
+# --- 5. ГЕНЕРАЦИЯ FSTAB ---
+echo ">>> Генерация fstab..."
+UUID_ROOT=$(blkid -s UUID -o value "$ROOT_PART")
+UUID_EFI=$(blkid -s UUID -o value "$EFI_PART")
+UUID_SWAP=$(blkid -s UUID -o value "$SWAP_PART")
 
-# Вход в chroot
-echo "Вход в chroot..."
-chroot /mnt/gentoo /bin/bash <<EOF_CHROOT
+cat <<EOF > /mnt/gentoo/etc/fstab
+UUID=$UUID_EFI   /efi         vfat    umask=0077     0 2
+UUID=$UUID_SWAP  none         swap    sw             0 0
+UUID=$UUID_ROOT  /            ext4    noatime        0 1
+EOF
+
+# --- 6. РАБОТА ВНУТРИ CHROOT ---
+cat <<EOF_CHROOT > /mnt/gentoo/root/install_inside.sh
+#!/bin/bash
 source /etc/profile
+export PS1="(chroot) $PS1"
 
-# Настройка Portage
-sed -i '' "s/^USE=\"\(.*\)\"/USE=\"\1 elogind\"/" "$MAKECONF"
-echo 'ACCEPT_LICENSE="*"' >> /etc/portage/make.conf
+echo ">>> Синхронизация репозитория..."
 emerge-webrsync
-emerge --sync
+eselect profile set default/linux/amd64/23.0/no-multilib
 
-# Установка базовых пакетов
-emerge linux-firmware app-admin/sudo net-wireless/wpa_supplicant dhcpcd cpuid2cpuflags || exit 1
+echo ">>> Базовая настройка системы..."
+echo "Europe/Samara" > /etc/timezone
+emerge --config sys-libs/timezone-data
 
-echo "CPU_FLAGS_X86=$(cpuid2cpuflags | grep -oP ': \K.*')" | sed 's/=/="/;s/$/"/' >> /etc/portage/make.conf
-sed -i 's/CONSOLEFONT="default8x16"/CONSOLEFONT="cyr-sun16"/' /etc/conf.d/consolefont
-sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
-echo 'ru_RU.UTF-8 UTF-8' >> /etc/locale.gen
+# Локаль
+echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+echo "ru_RU.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen
+eselect locale set en_US.UTF-8
 env-update && source /etc/profile
 
-# Настройка видеокарты 
-nvidia=$(lspci | grep -e VGA -e 3D | grep 'NVIDIA' 2> /dev/null || echo '')
-amd=$(lspci | grep -e VGA -e 3D | grep 'AMD' 2> /dev/null || echo '')
-intel=$(lspci | grep -e VGA -e 3D | grep 'Intel' 2> /dev/null || echo '')
-if [[ -n "$nvidia" ]]; then
-  echo 'VIDEO_CARDS="nouveau"' >> /etc/portage/make.conf
-fi
-if [[ -n "$amd" ]]; then
-  echo 'VIDEO_CARDS="amdgpu radeon radeonsi"' >> /etc/portage/make.conf
-fi
-if [[ -n "$intel" ]]; then
-  echo 'VIDEO_CARDS="intel"' >> /etc/portage/make.conf
-fi
+# Консольный шрифт
+echo 'consolefont="cyr-sun16"' > /etc/conf.d/consolefont
+rc-update add consolefont boot
 
-# Установка ядра
+echo ">>> Установка ядра и софта..."
+emerge sys-kernel/linux-firmware sys-kernel/installkernel app-admin/sudo net-misc/dhcpcd net-wireless/wpa_supplicant sys-fs/dosfstools sys-boot/grub
+
+# ЯДРО
 if [[ "$KERNEL_TYPE" == "binary" ]]; then
-    echo "Установка бинарного ядра..."
-    echo "sys-kernel/installkernel dracut" > /etc/portage/package.use/installkernel
-    emerge sys-kernel/linux-firmware sys-kernel/installkernel sys-kernel/gentoo-kernel-bin || exit 1
+    echo "Установка бинарного ядра (sys-kernel/gentoo-kernel-bin)..."
+    emerge sys-kernel/gentoo-kernel-bin
 else
-    echo "Установка исходного ядра и сборка..."
-    emerge sys-kernel/linux-firmware sys-kernel/installkernel gentoo-sources genkernel || exit 1
+    echo "Компиляция ядра (gentoo-sources)..."
+    emerge sys-kernel/gentoo-sources sys-kernel/genkernel
     genkernel all
 fi
 
-# Настройка загрузчика
-emerge grub efibootmgr
-grub-install --target=x86_64-efi --efi-directory=/boot/efi ${DISK}
-sed -i 's/^#GRUB_DISABLE_LINUX_UUID=[a-z]*/GRUB_DISABLE_LINUX_UUID=true/' /etc/default/grub
-sed -i 's/^#GRUB_CMDLINE_LINUX_DEFAULT=""/GRUB_CMDLINE_LINUX_DEFAULT="rootfstype=ext4 panic=30 vga=791"/' /etc/default/grub
-sed -i 's/^#*GRUB_TIMEOUT=[0-9]+/GRUB_TIMEOUT=3/' /etc/default/grub
-grep -q console= /proc/cmdline && sed -i 's/ vga=791/ console=tty0 console=ttyS0,115200/' /etc/default/grub
-grep -q console= /proc/cmdline && sed -i 's/^#GRUB_TERMINAL=.*/GRUB_TERMINAL="console serial"/' /etc/default/grub
-grep -q console= /proc/cmdline && echo 'GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0"' >> /etc/default/grub
-# enable in inittab
-grep -q console= /proc/cmdline && sed -i 's/^#s0:/s0:/' /etc/inittab
+echo ">>> Настройка загрузчика GRUB..."
+grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=Gentoo
+
+# Базовая конфигурация GRUB
+sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=2/' /etc/default/grub
+sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet"/' /etc/default/grub
+
 grub-mkconfig -o /boot/grub/grub.cfg
-ls -lh /boot; find /boot/efi; efibootmgr
 
-# Настройка Wi-Fi
-rc-update add wpa_supplicant default || echo "wpa_supplicant не установлен"
+echo ">>> Финализация..."
 rc-update add dhcpcd default
+# rc-update add wpa_supplicant default
 
-# Обновление fstab
-# echo "$ROOT_PART / ext4 defaults 0 1" >> /etc/fstab
-# echo "$BOOT_PART /boot ext4 defaults 0 2" >> /etc/fstab
-# echo "$HOME_PART /home ext4 defaults 0 2" >> /etc/fstab
-# echo "$SWAP_PART none swap sw 0 0" >> /etc/fstab
+# Пароль root
+echo "root:12345" | chpasswd
 
-# Установка root-пароля
-echo "Установка root-пароля..."
-echo -e "123\n123" | passwd
-
+exit
 EOF_CHROOT
 
-# Отмонтирование и завершение
-echo "Завершение установки..."
+# Запуск скрипта внутри chroot
+chmod +x /mnt/gentoo/root/install_inside.sh
+chroot /mnt/gentoo /root/install_inside.sh
+
+# --- 7. ЗАВЕРШЕНИЕ ---
+echo ">>> Установка завершена!"
+echo ">>> Пароль root: 12345"
+rm /mnt/gentoo/root/install_inside.sh
+cd /
 umount -l /mnt/gentoo/dev{/shm,/pts,}
 umount -R /mnt/gentoo
-swapoff "$SWAP_PART"
+echo ">>> Теперь можно перезагрузиться (reboot)."
